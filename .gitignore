@@ -1,0 +1,44 @@
+# ---- Python (elou_avt_twin) ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.log
+.DS_Store
+
+# ---- Runtime database (regenerates on start) ----
+elou_avt_twin/sessions.db
+elou_avt_twin/sessions.db-wal
+elou_avt_twin/sessions.db-shm
+*.db-wal
+*.db-shm
+
+# ---- Secrets & local config ----
+opencode1.json
+*.env
+.env
+.auth_secret
+elou_avt_twin/.auth_secret
+config/local_config.json
+
+# ---- Frontend (elou_avt_web) ----
+node_modules/
+elou_avt_web/node_modules/
+elou_avt_web/dist/
+dist/
+*.tsbuildinfo
+*.tsbuildinfo.json
+
+# ---- Docker stack (docker-compose.yml) ----
+# Postgres host bind-mount data directory (see docker-compose.yml `db` service)
+data/
+# Docker Secrets source files (see docker-compose.yml top-level `secrets:` and
+# start.sh/start.ps1, which generate these) -- real credentials, never commit.
+secrets/

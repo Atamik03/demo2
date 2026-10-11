@@ -1,0 +1,691 @@
+import ControlMode from './ControlMode';
+import { useEffect, useRef, useState } from 'react';
+import type { NodeTelemetry, EquipmentSpec, AlarmSetpoint, HistoryResponse } from '../types';
+import { TYPE_COLORS, fmtParam, PARAM_LABELS } from '../schemeConfig';
+import TrendChart from './TrendChart';
+import EquipmentPassport from './EquipmentPassport';
+import { api } from '../api';
+
+interface Props {
+  nodeId: string;
+  nodeName: string;
+  nodeType: string;
+  schemeParams: Record<string, unknown>;
+  telemetry: NodeTelemetry | null;
+  history?: HistoryResponse | null;
+  disp?: string[];
+  onUpdateDisp?: (nodeId: string, keys: string[]) => void;
+  onAction: (equipmentId: string, actionType: string, value?: number | null) => Promise<void>;
+  onFailure: (equipmentId: string) => Promise<void>;
+  onRename: (nodeId: string, name: string) => void;
+  onDelete: (nodeId: string) => void;
+  onUpdateParams: (equipmentId: string, params: Record<string, number>) => Promise<void>;
+  onUpdateSchemeParam?: (nodeId: string, key: string, value: unknown) => void;
+  canEditScheme?: boolean;
+  canManageTwin?: boolean;
+  canInjectFailure?: boolean;
+  readOnly?: boolean;
+  onRequestFieldCheck?: (equipmentId: string, equipmentName: string) => Promise<void>;
+}
+
+// Plant-wide aggregate alarm parameters (no node_id) shown on the equipment
+// they describe: column_pressure -> any column, feed_flow -> ELOU/pumps, ...
+const AGGREGATE_ALARM_NODE_TYPES: Record<string, string[]> = {
+  feed_flow: ['elou', 'pump'],
+  column_pressure: ['column'],
+  column_temperature: ['column'],
+  furnace_temperature: ['heater'],
+};
+
+const alarmDisplayUnit = (unit: string): string => ({ Pa: 'кгс/см² изб.', K: '°C', 'kg/s': 'т/ч' }[unit] ?? unit);
+const toDisplay = (unit: string, v: number | null): string => {
+  if (v === null) return '';
+  if (unit === 'Pa') return String((v - 101325) / 98066.5);
+  if (unit === 'K') return String(v - 273.15);
+  if (unit === 'kg/s') return String(v * 3.6);
+  return String(v);
+};
+
+const toEngine = (unit: string, s: string): number =>
+  unit === 'Pa' ? Number(s) * 98066.5 + 101325
+    : unit === 'K' ? Number(s) + 273.15
+      : unit === 'kg/s' ? Number(s) / 3.6
+        : Number(s);
+
+export default function Inspector({ nodeId, nodeName, nodeType, schemeParams, telemetry, history = null, disp = [], onUpdateDisp, onAction, onFailure, onRename, onDelete, onUpdateParams, onUpdateSchemeParam, canEditScheme = true, canManageTwin = true, canInjectFailure = false, readOnly = false, onRequestFieldCheck }: Props) {
+  const [valvePos, setValvePos] = useState(60);
+  const [fuel, setFuel] = useState(0.8);
+  const [reflux, setReflux] = useState(2.0);
+  const [feedFlow, setFeedFlow] = useState(100);
+  const [feedTemp, setFeedTemp] = useState(25);
+  const [pumpSpeed, setPumpSpeed] = useState(1450);
+  const [name, setName] = useState('');
+  const [spec, setSpec] = useState<EquipmentSpec | null>(null);
+  const [draft, setDraft] = useState<Record<string, number>>({});
+  const [alarmSetpoints, setAlarmSetpoints] = useState<AlarmSetpoint[]>([]);
+  const [alarmDraft, setAlarmDraft] = useState<Record<string, { low_low: string; low: string; high: string; high_high: string }>>({});
+  const [alarmMsg, setAlarmMsg] = useState<string>('');
+  const [trendParam, setTrendParam] = useState('');
+  const [fieldRequestState, setFieldRequestState] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
+  const hydratedNode = useRef<string | null>(null);
+  const nameHydrated = useRef<string | null>(null);
+
+  const loadAlarmSetpoints = () => {
+    if (!nodeId) return;
+    api.getAlarmSetpoints()
+      .then((resp) => {
+        const mine = resp.setpoints.filter(
+          (s) => s.node_id === nodeId || (s.node_id === null && (AGGREGATE_ALARM_NODE_TYPES[s.parameter] ?? []).includes(nodeType)),
+        );
+        setAlarmSetpoints(mine);
+        const d: Record<string, { low_low: string; low: string; high: string; high_high: string }> = {};
+        mine.forEach((s) => {
+          d[s.parameter] = {
+            low_low: toDisplay(s.unit, s.low_low),
+            low: toDisplay(s.unit, s.low),
+            high: toDisplay(s.unit, s.high),
+            high_high: toDisplay(s.unit, s.high_high),
+          };
+        });
+        setAlarmDraft(d);
+      })
+      .catch(() => undefined);
+  };
+
+  useEffect(() => {
+    setSpec(null);
+    setDraft({});
+    setAlarmSetpoints([]);
+    setAlarmDraft({});
+    setAlarmMsg('');
+    setFieldRequestState('idle');
+    if (!nodeId) return;
+    api.getEquipmentSpec(nodeId)
+      .then((s) => {
+        setSpec(s);
+        const d: Record<string, number> = {};
+        s.params.forEach((p) => {
+          if (p.value !== null) d[p.key] = p.value;
+        });
+        setDraft(d);
+      })
+      .catch(() => undefined);
+    loadAlarmSetpoints();
+  }, [nodeId]);
+
+  useEffect(() => {
+    if (!telemetry) return;
+    // In AUTO the displayed opening is a live actuator indication.  Keep the
+    // manual slider independent so an operator can prepare a manual value
+    // without telemetry overwriting it while dragging.
+    if (telemetry.control_mode === 'АВТ' && typeof telemetry.params.position === 'number') {
+      setValvePos(telemetry.params.position);
+    }
+    if (hydratedNode.current === nodeId) return;
+    hydratedNode.current = nodeId;
+    const p = telemetry.params;
+    if (typeof p.position === 'number') setValvePos(p.position);
+    if (typeof p.fuel_flow === 'number') setFuel(p.fuel_flow);
+    if (typeof p.flow_kg_s === 'number' && telemetry.type === 'source') setFeedFlow(p.flow_kg_s);
+    if (typeof p.temperature_c === 'number' && telemetry.type === 'source') setFeedTemp(p.temperature_c);
+    if (typeof p.speed_rpm === 'number' && telemetry.type === 'pump') setPumpSpeed(p.speed_rpm);
+  }, [nodeId, telemetry]);
+
+  useEffect(() => {
+    if (nameHydrated.current === nodeId) return;
+    nameHydrated.current = nodeId;
+    setName(nodeName);
+  }, [nodeId, nodeName]);
+
+  const commitName = () => {
+    const trimmed = name.trim();
+    if (!trimmed || !nodeId) {
+      setName(nodeName);
+      return;
+    }
+    if (trimmed !== nodeName) onRename(nodeId, trimmed);
+  };
+
+  const saveAlarmSetpoints = () => {
+    setAlarmMsg('');
+    const requests = alarmSetpoints.map((s) => {
+      const d = alarmDraft[s.parameter];
+      const patch: { low_low?: number; low?: number; high?: number; high_high?: number } = {};
+      if (d) {
+        if (d.low_low !== '') patch.low_low = toEngine(s.unit, d.low_low);
+        if (d.low !== '') patch.low = toEngine(s.unit, d.low);
+        if (d.high !== '') patch.high = toEngine(s.unit, d.high);
+        if (d.high_high !== '') patch.high_high = toEngine(s.unit, d.high_high);
+      }
+      return api.updateAlarmSetpoint(s.parameter, patch);
+    });
+    Promise.all(requests)
+      .then(() => {
+        setAlarmMsg('Уставки сохранены');
+        loadAlarmSetpoints();
+      })
+      .catch(() => setAlarmMsg('Ошибка сохранения уставок'));
+  };
+
+  if (!nodeId) {
+    return <div className="inspector-empty">Выберите объект на схеме, чтобы увидеть параметры и управление.</div>;
+  }
+
+  // Объект есть в схеме, но пока нет телеметрии с бэкенда (новая схема,
+  // ещё не сохранена / не создана в движке). Показываем редактор по params схемы.
+  if (!telemetry) {
+    return (
+      <div>
+        <div className="inspector-header" style={{ borderLeft: `3px solid ${TYPE_COLORS[nodeType] ?? '#38bdf8'}` }}>
+          {canEditScheme ? (
+            <input
+              className="rename-input"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onBlur={commitName}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+              }}
+              spellCheck={false}
+            />
+          ) : (
+            <div style={{ fontWeight: 700 }}>{nodeName || nodeId}</div>
+          )}
+          <div style={{ fontSize: 10, color: '#7f93a6' }}>{nodeId} • {nodeType}</div>
+        </div>
+        <div style={{ color: '#e8b93a', fontSize: 11, fontWeight: 700, margin: '4px 0 10px' }}>
+          ● НА СХЕМЕ · ТЕЛЕМЕТРИИ НЕТ
+        </div>
+        <div className="param-list">
+          {Object.entries(schemeParams)
+            .filter(([k]) => k !== 'mnemo' && k !== 'preset')
+            .map(([k, v]) => (
+            <div className="param-row" key={k}>
+              <span>{PARAM_LABELS[k]?.label ?? k}</span>
+              <span>{typeof v === 'number' ? fmtParam(k, v) : String(v)}</span>
+            </div>
+          ))}
+        </div>
+        <div className="inspector-hint">
+          Объект ещё не создан в расчётном движке. Нажмите «Сохранить схему», чтобы запустить симуляцию и получить телеметрию.
+        </div>
+        {canEditScheme && (
+          <div style={{ marginTop: 12 }}>
+            <button className="btn btn-danger" onClick={() => onDelete(nodeId)}>🗑 Удалить объект</button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  const color = TYPE_COLORS[telemetry.type] ?? '#38bdf8';
+  // Failure modes are backend identifiers.  Never expose them to the
+  // operator: the HMI must use an action-oriented Russian description.
+  const failureLabel: Record<string, string> = {
+    MECHANICAL_FAILURE: 'Отказ оборудования',
+    PAZ_INTERLOCK: 'Блокировка ПАЗ',
+    EMERGENCY_STOP: 'Аварийный останов',
+    CAVITATION: 'Кавитация насоса',
+  };
+  const statusText = telemetry.failed
+    ? `АВАРИЯ: ${failureLabel[String(telemetry.failure_mode ?? '')] ?? 'Отказ оборудования'}`
+    : telemetry.type === 'gate_valve'
+      ? telemetry.params?.open
+        ? 'ОТКРЫТА'
+        : 'ЗАКРЫТА'
+      : telemetry.running === null
+        ? 'Граница'
+        : telemetry.running
+          ? 'РАБОТАЕТ'
+          : 'ОСТАНОВЛЕН';
+
+  const control = (() => {
+    switch (telemetry.type) {
+      case 'pump':
+        return (
+          <div className="ctrl-group">
+            <button className="btn btn-start" disabled={telemetry.running === true} onClick={() => onAction(nodeId, 'TURN_ON')}>▶ Запустить</button>
+            <button className="btn btn-stop" disabled={telemetry.running !== true} onClick={() => onAction(nodeId, 'TURN_OFF')}>■ Остановить</button>
+            <button className="btn btn-danger" disabled={telemetry.running !== true} onClick={() => onAction(nodeId, 'EMERGENCY_STOP')}>⛔ Эвакуационный стоп</button>
+            {canInjectFailure && (
+              <button className="btn btn-warn" onClick={() => onFailure(nodeId)}>⚠ Смоделировать отказ</button>
+            )}
+            <label className="ctrl-label">
+              Частота вращения: {pumpSpeed} об/мин
+              <input
+                type="range"
+                min={0}
+                max={2900}
+                step={50}
+                value={pumpSpeed}
+                onChange={(e) => setPumpSpeed(Number(e.target.value))}
+              />
+            </label>
+            <button className="btn btn-start" onClick={() => void onAction(nodeId, 'SET_SPEED', pumpSpeed)}>Применить частоту</button>
+          </div>
+        );
+      case 'valve':
+      case 'angle_valve':
+        {
+          const automatic = telemetry.control_mode === 'АВТ';
+          const actualPosition = typeof telemetry.params.position === 'number'
+            ? telemetry.params.position : null;
+        return (
+          <div className="ctrl-group">
+            {automatic && actualPosition !== null && (
+              <div className="ctrl-label"><b>Текущее открытие (АВТ): {actualPosition.toFixed(0)}%</b></div>
+            )}
+            <label className="ctrl-label">
+              {automatic ? 'Позиция для ручного режима' : 'Позиция клапана'}: {valvePos.toFixed(0)}%
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={5}
+                value={valvePos}
+                onChange={(e) => setValvePos(Number(e.target.value))}
+              />
+            </label>
+            <button className="btn btn-start" onClick={() => void onAction(nodeId, 'SET_VALUE', valvePos / 100)}>Применить открытие</button>
+            {canInjectFailure && (
+              <button className="btn btn-warn" onClick={() => onFailure(nodeId)}>⚠ Отказ (заклинил)</button>
+            )}
+          </div>
+        );
+        }
+      case 'gate_valve':
+        return (
+          <div className="ctrl-group">
+            <button className="btn btn-start" disabled={telemetry.params?.open === true} onClick={() => onAction(nodeId, 'TURN_ON')}>⭯ Открыть</button>
+            <button className="btn btn-stop" disabled={telemetry.params?.open !== true} onClick={() => onAction(nodeId, 'TURN_OFF')}>⏹ Закрыть</button>
+            {canInjectFailure && (
+              <button className="btn btn-warn" onClick={() => onFailure(nodeId)}>⚠ Отказ (заклинила)</button>
+            )}
+          </div>
+        );
+      case 'heater':
+        return (
+          <div className="ctrl-group">
+            <label className="ctrl-label">
+              Расход топлива: {(fuel * 3.6).toFixed(2)} т/ч
+              <input
+                type="range"
+                min={0}
+                max={4.32}
+                step={0.072}
+                value={fuel * 3.6}
+                onChange={(e) => setFuel(Number(e.target.value) / 3.6)}
+              />
+            </label>
+            <button className="btn btn-start" onClick={() => void onAction(nodeId, 'SET_VALUE', fuel)}>Применить расход</button>
+            <button className="btn btn-danger" disabled={telemetry.running !== true} onClick={() => onAction(nodeId, 'EMERGENCY_STOP')}>⛔ Сброс топлива</button>
+          </div>
+        );
+      case 'column':
+        return (
+          <div className="ctrl-group">
+            <label className="ctrl-label">
+              Флегмовое число: {reflux.toFixed(1)}
+              <input
+                type="range"
+                min={0.5}
+                max={5}
+                step={0.1}
+                value={reflux}
+                onChange={(e) => setReflux(Number(e.target.value))}
+              />
+            </label>
+            <button className="btn btn-start" onClick={() => void onAction(nodeId, 'SET_VALUE', reflux)}>Применить флегмовое число</button>
+          </div>
+        );
+      case 'source': {
+        const isFeed = nodeId === 'src_feed' || telemetry.params?.pressure_driven === true;
+        return (
+          <div className="ctrl-group">
+            {!isFeed && (
+              <label className="ctrl-label">
+                Расход: {(feedFlow * 3.6).toFixed(1)} т/ч
+                <input type="range" min={0} max={720} step={3.6} value={feedFlow * 3.6} onChange={(e) => setFeedFlow(Number(e.target.value) / 3.6)} />
+              </label>
+            )}
+            <label className="ctrl-label">
+              Температура: {feedTemp} °C
+              <input type="number" min={-50} max={1000} step={1} value={feedTemp} onChange={(e) => setFeedTemp(Number(e.target.value))} />
+            </label>
+            {isFeed && (
+              <div className="inspector-hint">Расход сырья определяется открытием клапана FV-1/2/3 и частотой вращения насоса Н-1.</div>
+            )}
+            {canManageTwin && (
+              <button className="btn btn-start" onClick={() => {
+                const params: Record<string, number> = { temperature_c: feedTemp };
+                if (!isFeed) params.flow_kg_s = feedFlow;
+                onUpdateParams(nodeId, params);
+              }}>
+                Применить граничные условия
+              </button>
+            )}
+          </div>
+        );
+      }
+      case 'elou':
+        return (
+          <div className="ctrl-group">
+            <button className="btn btn-start" disabled={telemetry.running === true} onClick={() => onAction(nodeId, 'TURN_ON')}>▶ Включить</button>
+            <button className="btn btn-stop" disabled={telemetry.running !== true} onClick={() => onAction(nodeId, 'TURN_OFF')}>■ Выключить</button>
+          </div>
+        );
+      case 'heat_exchanger': {
+        if (!canEditScheme || schemeParams?.preset === 'air_cooler') return null;
+        const role = schemeParams?.thermal_role === 'cooler' ||
+          (schemeParams?.thermal_role !== 'heater' && /^[ХX]\s*-/i.test(nodeName.trim()))
+          ? 'cooler'
+          : 'heater';
+        return (
+          <div className="ctrl-group">
+            <div className="panel-title" style={{ margin: 0 }}>УГО ТЕПЛООБМЕННИКА</div>
+            <label className="param-check">
+              <input
+                type="radio"
+                name={`hx-role-${nodeId}`}
+                checked={role === 'heater'}
+                onChange={() => onUpdateSchemeParam?.(nodeId, 'thermal_role', 'heater')}
+              />
+              <span>Нагреватель — тепло передаётся продукту</span>
+            </label>
+            <label className="param-check">
+              <input
+                type="radio"
+                name={`hx-role-${nodeId}`}
+                checked={role === 'cooler'}
+                onChange={() => onUpdateSchemeParam?.(nodeId, 'thermal_role', 'cooler')}
+              />
+              <span>Охладитель — тепло отводится от продукта</span>
+            </label>
+          </div>
+        );
+      }
+      case 'tank':
+      case 'separator':
+      case 'separator_s1k': {
+        // Настройка доступна только в редакторе схемы.
+        if (!canEditScheme) return null;
+        const lmode = schemeParams?.level_mode === 'water' ? 'water' : 'reflux';
+        return (
+          <div className="ctrl-group">
+            <div className="panel-title" style={{ margin: 0 }}>ОБОЗНАЧЕНИЕ УРОВНЯ</div>
+            <label className="param-check">
+              <input
+                type="radio"
+                name={`lmode-${nodeId}`}
+                checked={lmode === 'reflux'}
+                onChange={() => onUpdateSchemeParam?.(nodeId, 'level_mode', 'reflux')}
+              />
+              <span>Флегма — тёмная жидкость, внизу вода, сверху пустота</span>
+            </label>
+            <label className="param-check">
+              <input
+                type="radio"
+                name={`lmode-${nodeId}`}
+                checked={lmode === 'water'}
+                onChange={() => onUpdateSchemeParam?.(nodeId, 'level_mode', 'water')}
+              />
+              <span>Вода — только вода, сверху пустота</span>
+            </label>
+          </div>
+        );
+      }
+      case 'mixer': {
+        // Настройка числа входов доступна в редакторе схемы.
+        if (!canEditScheme) return null;
+        const n = typeof schemeParams?.num_inputs === 'number' ? schemeParams.num_inputs : 2;
+        return (
+          <div className="ctrl-group">
+            <div className="panel-title" style={{ margin: 0 }}>ЧИСЛО ВХОДОВ</div>
+            <label className="ctrl-label">
+              Входы смесителя: {n}
+              <input
+                type="number"
+                min={1}
+                max={8}
+                step={1}
+                value={n}
+                onChange={(e) =>
+                  onUpdateSchemeParam?.(nodeId, 'num_inputs', Math.max(1, Math.min(8, Number(e.target.value))))
+                }
+              />
+            </label>
+          </div>
+        );
+      }
+      case 'splitter': {
+        // Настройка числа выходов доступна в редакторе схемы.
+        if (!canEditScheme) return null;
+        const n = typeof schemeParams?.num_outputs === 'number' ? schemeParams.num_outputs : 2;
+        return (
+          <div className="ctrl-group">
+            <div className="panel-title" style={{ margin: 0 }}>ЧИСЛО ВЫХОДОВ</div>
+            <label className="ctrl-label">
+              Выходы разъединителя: {n}
+              <input
+                type="number"
+                min={1}
+                max={8}
+                step={1}
+                value={n}
+                onChange={(e) =>
+                  onUpdateSchemeParam?.(nodeId, 'num_outputs', Math.max(1, Math.min(8, Number(e.target.value))))
+                }
+              />
+            </label>
+          </div>
+        );
+      }
+      default:
+        return null;
+    }
+  })();
+
+  const paramRows = Object.entries(telemetry.params)
+    .filter(([k, v]) => v !== null && v !== undefined)
+    .map(([k, v]) => {
+      const meta = PARAM_LABELS[k];
+      const display =
+        k === 'converged'
+          ? String(v)
+          : k === 'open'
+            ? v
+              ? 'Открыта'
+              : 'Закрыта'
+            : typeof v === 'number'
+              ? fmtParam(k, v)
+              : String(v);
+      return (
+        <div className="param-row" key={k}>
+          <span>{meta?.label ?? k}</span>
+          <span>{display}</span>
+        </div>
+      );
+    });
+
+  // Per-node history series for the currently selected equipment. The backend
+  // emits each node's measurable params as '<node_id>:<param>', so we pick the
+  // matching prefix and let the operator flip between them.
+  const nodeSeries = Object.keys(history?.series ?? {})
+    .filter((k) => k.startsWith(`${nodeId}:`))
+    .map((k) => k.slice(nodeId.length + 1))
+    .filter((k) => (history?.series[`${nodeId}:${k}`] ?? []).length > 0);
+  const activeTrendParam =
+    nodeSeries.includes(trendParam) ? trendParam : (nodeSeries[0] ?? '');
+  const trendLabel = PARAM_LABELS[activeTrendParam]?.label ?? activeTrendParam;
+  const trendUnit = PARAM_LABELS[activeTrendParam]?.unit ?? '';
+
+  return (
+    <div>
+      <div className="inspector-header" style={{ borderLeft: `3px solid ${color}` }}>
+        {canEditScheme ? (
+          <input
+            className="rename-input"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            onBlur={commitName}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+            }}
+            spellCheck={false}
+          />
+        ) : (
+          <div style={{ fontWeight: 700 }}>{name || nodeId}</div>
+        )}
+        <div style={{ fontSize: 10, color: '#7f93a6' }}>{nodeId} • {telemetry.type}</div>
+      </div>
+      <div style={{ color: telemetry.failed ? '#f87171' : '#35d399', fontSize: 11, fontWeight: 700, margin: '4px 0 10px' }}>
+        ● {statusText}
+      </div>
+      {onRequestFieldCheck && (
+        <div className="ctrl-group" style={{ marginBottom: 10 }}>
+          <button className="btn btn-warn" disabled={fieldRequestState === 'sending'} onClick={async () => {
+            setFieldRequestState('sending');
+            try {
+              await onRequestFieldCheck(nodeId, nodeName || nodeId);
+              setFieldRequestState('sent');
+            } catch {
+              setFieldRequestState('error');
+            }
+          }}>
+            {fieldRequestState === 'sending' ? 'Отправляем…' : 'Попросить полевого проверить'}
+          </button>
+          {fieldRequestState === 'sent' && <div className="inspector-hint">Запрос отправлен полевому оператору.</div>}
+          {fieldRequestState === 'error' && <div className="inspector-hint" style={{ color: 'var(--danger)' }}>Не удалось отправить запрос.</div>}
+        </div>
+      )}
+      <div className="param-list">{paramRows}</div>
+      {nodeSeries.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <div className="panel-title">ГРАФИК ПАРАМЕТРА</div>
+          <select
+            className="scenario-select full"
+            value={activeTrendParam}
+            onChange={(e) => setTrendParam(e.target.value)}
+          >
+            {nodeSeries.map((k) => (
+              <option key={k} value={k}>
+                {PARAM_LABELS[k]?.label ?? k} ({PARAM_LABELS[k]?.unit ?? ''})
+              </option>
+            ))}
+          </select>
+          <TrendChart
+            history={history}
+            param={`${nodeId}:${activeTrendParam}`}
+            height={150}
+            label={trendLabel}
+            unit={trendUnit}
+          />
+        </div>
+      )}
+      {canEditScheme && onUpdateDisp && (
+        <div style={{ marginTop: 12 }}>
+          <div className="panel-title">ПОКАЗЫВАТЬ НА СХЕМЕ</div>
+          <div className="param-list">
+            {Object.keys(telemetry.params)
+              .filter((k) => telemetry.params[k] !== null && telemetry.params[k] !== undefined)
+              .map((k) => {
+                const on = disp.includes(k);
+                return (
+                  <label className="param-check" key={k}>
+                    <input
+                      type="checkbox"
+                      checked={on}
+                      onChange={() => {
+                        const next = on ? disp.filter((x) => x !== k) : [...disp, k];
+                        onUpdateDisp(nodeId, next);
+                      }}
+                    />
+                    <span>{PARAM_LABELS[k]?.label ?? k}</span>
+                  </label>
+                );
+              })}
+          </div>
+          <div className="inspector-hint">Отмеченные параметры показываются квадратиком рядом с объектом на схеме.</div>
+        </div>
+      )}
+      {telemetry?.params.heat_exchange_status && <p className="inspector-hint">{String(telemetry.params.heat_exchange_status)}</p>}
+      <ControlMode telemetry={telemetry} canControl={!readOnly}
+        onMode={value => { void onAction(nodeId, 'SET_MODE', value); }} />
+      {!readOnly && control && <div style={{ marginTop: 12 }}>{control}</div>}
+      {!readOnly && canManageTwin && alarmSetpoints.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <div className="panel-title">ОГРАНИЧЕНИЯ (АВАРИЙНЫЕ УСТАВКИ)</div>
+          <div className="param-editor">
+            {alarmSetpoints.map((s) => {
+              const d = alarmDraft[s.parameter] ?? { low_low: '', low: '', high: '', high_high: '' };
+              const short = s.parameter.replace(`${nodeId}_`, '');
+              return (
+                <div key={s.parameter} style={{ borderTop: '1px solid var(--border, #26374a)', paddingTop: 6, marginTop: 6 }}>
+                  <div style={{ fontSize: 12, color: '#cbd5e1', marginBottom: 4 }}>
+                    {PARAM_LABELS[short]?.label ?? short}
+                    <span style={{ color: '#7f93a6', marginLeft: 6 }}>{alarmDisplayUnit(s.unit)}</span>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 4 }}>
+                    <label className="ctrl-label" style={{ fontSize: 10 }} title="Нижний аварийный минимум">
+                      НН
+                      <input type="number" value={d.low_low} onChange={(e) => setAlarmDraft((p) => ({ ...p, [s.parameter]: { ...p[s.parameter], low_low: e.target.value } }))} />
+                    </label>
+                    <label className="ctrl-label" style={{ fontSize: 10 }} title="Нижний предупредительный">
+                      Н
+                      <input type="number" value={d.low} onChange={(e) => setAlarmDraft((p) => ({ ...p, [s.parameter]: { ...p[s.parameter], low: e.target.value } }))} />
+                    </label>
+                    <label className="ctrl-label" style={{ fontSize: 10 }} title="Верхний предупредительный">
+                      В
+                      <input type="number" value={d.high} onChange={(e) => setAlarmDraft((p) => ({ ...p, [s.parameter]: { ...p[s.parameter], high: e.target.value } }))} />
+                    </label>
+                    <label className="ctrl-label" style={{ fontSize: 10 }} title="Верхний аварийный максимум">
+                      ВВ
+                      <input type="number" value={d.high_high} onChange={(e) => setAlarmDraft((p) => ({ ...p, [s.parameter]: { ...p[s.parameter], high_high: e.target.value } }))} />
+                    </label>
+                  </div>
+                </div>
+              );
+            })}
+            <button className="btn btn-start" onClick={saveAlarmSetpoints}>Применить уставки</button>
+            {alarmMsg && <div className="inspector-hint">{alarmMsg}</div>}
+          </div>
+        </div>
+      )}
+      <EquipmentPassport nodeId={nodeId} />
+      {canEditScheme && canManageTwin && spec?.editable && spec.params.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <div className="panel-title">ФИЗ. СВОЙСТВА</div>
+          <div className="param-editor">
+            {spec.params.map((p) => (
+              <label className="ctrl-label" key={p.key}>
+                {p.label}
+                {p.unit ? ` (${p.unit})` : ''}
+                <input
+                  type="number"
+                  min={p.min}
+                  max={p.max}
+                  step={p.step}
+                  value={draft[p.key] ?? p.value ?? 0}
+                  onChange={(e) => setDraft((d) => ({ ...d, [p.key]: Number(e.target.value) }))}
+                />
+              </label>
+            ))}
+            <button className="btn btn-start" onClick={() => {
+              const params: Record<string, number> = {};
+              spec.params.forEach((p) => { params[p.key] = draft[p.key] ?? p.value ?? 0; });
+              onUpdateParams(nodeId, params);
+            }}>
+              Применить свойства
+            </button>
+          </div>
+        </div>
+      )}
+      {canEditScheme && (
+        <div style={{ marginTop: 12 }}>
+          <button className="btn btn-danger" onClick={() => onDelete(nodeId)}>🗑 Удалить объект</button>
+          <div className="inspector-hint">Переименование — Enter. Удаление — кнопка или Delete/Backspace. Не забудьте «Сохранить схему».</div>
+        </div>
+      )}
+    </div>
+  );
+}

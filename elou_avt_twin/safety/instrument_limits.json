@@ -1,0 +1,52 @@
+{
+  "PRSA204": {
+    "parameter": "pressure_gauge_kgf_cm2",
+    "unit": "кгс/см² изб.",
+    "high": 4.5,
+    "high_high": 4.8,
+    "source": "3. Описание технологического процесса.pdf, стр. 8"
+  },
+  "PRSA213": {
+    "parameter": "pressure_gauge_kgf_cm2",
+    "unit": "кгс/см² изб.",
+    "high": 1,
+    "high_high": 1.5,
+    "source": "3. Описание технологического процесса.pdf, стр. 11"
+  },
+  "LSA641A": {
+    "parameter": "level_m",
+    "unit": "м",
+    "low_low": 3.5,
+    "source": "3. Описание технологического процесса.pdf, стр. 5"
+  },
+  "LS644A": {
+    "parameter": "level_m",
+    "unit": "м",
+    "low_low": 3.5,
+    "source": "3. Описание технологического процесса.pdf, стр. 5"
+  },
+  "LSA640A": {
+    "parameter": "level_m",
+    "unit": "м",
+    "low_low": 3.5,
+    "source": "3. Описание технологического процесса.pdf, стр. 5"
+  },
+  "LS643A": {
+    "parameter": "level_m",
+    "unit": "м",
+    "low_low": 3.5,
+    "source": "3. Описание технологического процесса.pdf, стр. 5"
+  },
+  "LSA639A": {
+    "parameter": "level_m",
+    "unit": "м",
+    "low_low": 3.5,
+    "source": "3. Описание технологического процесса.pdf, стр. 5"
+  },
+  "LS642A": {
+    "parameter": "level_m",
+    "unit": "м",
+    "low_low": 3.5,
+    "source": "3. Описание технологического процесса.pdf, стр. 5"
+  }
+}
